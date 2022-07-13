@@ -1,0 +1,174 @@
+== Cassandra coordinator feasibility study
+
+This doc just summarises a couple of points related to a Cassandra node running as a thin client to a cluster, without any significant order.
+
+=== Java driver connection and token aware load balancing.
+
+I am talking about Java driver of version 4.x of Datastax.
+
+Without white-listing only coordinator node, I was getting errors in the driver. The reason, obviously, is that load balancing policy will try
+to reach other nodes, which is not possbile, because they are not visible, network-wise, as they are behind an AWS load balancer.
+
+Hence, we need to white-list only nodes the driver is allowed to connect.
+
+White-listing is done differently in driver version 3 and 4. In version 3, there is
+https://docs.datastax.com/en/drivers/java/3.11/com/datastax/driver/core/policies/WhiteListPolicy.html[dedicated] policy which one
+can wrap around other policies (token aware policy, for example).
+
+In driver of version 4, this is not possible and one has to manually code it. It looks like this:
+
+[source,java]
+----
+// get UUID of the coordinator first, _somehow_
+UUID coordinator = UUID.fromString("uuid of the coordinator node");
+CqlSession
+    .builder()
+    .withNodeFilter(node -> coordinator.equals(node.getHostId()))
+    .build();
+----
+
+This method is actually already deprecated in driver version 4.14.1 I used, and they recommend using `NodeDistanceEvaluator` like this:
+
+[source,java]
+----
+UUID coordinator = UUID.fromString("uuid of the coordinator node");
+NodeDistanceEvaluator evaluator = (node, localDc) -> {
+    return node.getHostId().equals(coordinator) ? null : NodeDistance.IGNORED
+};
+CqlSession
+    .builder()
+    .withNodeDistanceEvaluator(evaluator)
+    .build();
+----
+
+No way around this. We might be smart to somehow provide our nice little helper implementation of this or some logic
+around but in order to not contact nodes behind LB, we need to ever contact just coordinator, which is done by filter
+or node distance evaluator.
+
+If you do not use these filtering approaches, you will see errors in the logs as driver tried to contact a node it can not.
+Interestingly enough, the internal mechanics of the driver will try next node available (which eventually happens to be
+a coordinator) so these errors are not logged and more into the future we go less errors we see, because driver will penalise
+nodes to which it can not connect successfully so next round of node-picking will basically leave the node behind LB out.
+
+Neverthless, filtering is the way to do this properly.
+
+When it comes to token aware policy, I do not think that this "token aware" logic makes sense. In driver of version 4,
+you set so-called routing key, like this:
+
+[source,java]
+----
+SimpleStatement select = QueryBuilder.selectFrom("test", "test").all()
+        .whereColumn("id")
+        .isEqualTo(QueryBuilder.literal(uuid))
+        .build();
+
+select.setKeyspace("test");
+
+ProtocolVersion protocolVersion = session.getContext().getProtocolVersion();
+select = select.setRoutingKey(TypeCodecs.UUID.encode(uuid, protocolVersion));
+
+ResultSet execute = session.execute(select);
+----
+
+Javadoc around this logic says:
+
+_This provides a hint of the partition that the request operates on. When the driver picks a coordinator for execution, it will prioritize the replicas that own that partition, in order to avoid an extra network jump on the server side.
+Routing information is optional: if either keyspace or key is null, token-aware routing is disabled for this request._
+
+In other words - if we execute a query with a routing key set, it will pick replicas which happen to own that partition so
+it does not have to go to a coordinator node which does not hold that data (which would have to ask replicas in turn),
+so it saves that one hop.
+
+However, this logic is broken with a thin client, because we have a white-list policy, so whatever request we are doing,
+it will _always_ go to thin client first which then re-routes this to the right nodes interally (Cassandra does this itself).
+
+Hence there will be always at least one hop by definition because we have a thin client in the way and from there
+it does not matter.
+
+=== Commit logs and memtables
+
+Thin client does not store any data hence it does not put any user data into commit logs either. One can skip everyhing commitlog-related when it comes to node configuration.
+
+Thin client also completely bypasses memtables.
+
+=== Caches
+
+I do not think this is applicable either on the thin client because it does not hold any data, by definition, so having a row cache, for example, does not make a lot of sense.
+
+I empirically verified that row cache settings in cassandra.yaml for a thin client are basically no-op. When I inserted data into a table, and I selected that row on some key, thin client did not cache anything but normal client did (looking into JMX row cache metrics).
+
+This effectively means that one can completely ignore row and key cache settings for thin client as it is not applicable.
+
+=== Creation of keyspaces / tables.
+
+When it comes to data which are held by a thin client when a keyspace or table is created, it just creates empty directory structute with keyspace / table name. It is basically a skeleton directory structure without any data (SSTables). In other words, data as such are not there, but the directory structure is. It looks like a proper table just with no data in it.
+
+Creation of a snapshot on a thin client does create snapshot just fine but again, this snapshot holds no data, just metadata - manifest.json and schema.cql
+
+I discovered a bug when I was testing keyspace creation. Imagine you have a cluster of 3 nodes out of which you have 1 coordinator (thin client) and you create this keyspace:
+
+[source,sql]
+----
+CREATE KEYSPACE example WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 3};
+----
+
+You specify RF to be 3, because you think you have three nodes. Then you go to insert some data
+
+[source,sql]
+----
+cqlsh> CONSISTENCY THREE;
+cqlsh> INSERT INTO example.tbl (id) values ('1');
+----
+
+This fails. Because you do not have 3 replicas, you have only 2 as you can not save anything on the coordinator.
+
+The fix would consist of us checking in Cassandra code whether there is enough so-called members (of the ring), (nodes which are not thin clients) which is equal or bigger than your specified RF.
+
+Other solution would consist of https://issues.apache.org/jira/browse/CASSANDRA-17500[Cassandra guardrail] but this will
+be available from Cassandra 4.2.
+
+=== Do nodes do what they are supposed to do?
+
+Joey was asking if coordinator only coordinates and data node only works with data. My answer is I believe that is true.
+Coordinator node has not cached anything nor it saves any data locally but schema changes and system tables.
+
+=== Affected plugins
+
+This setup might affect various libraries Instaclstr offers which is not so obvious. Below is their (not-exhaustive) enumeration.
+
+==== Esop & Icarus
+
+When it comes to backups, there is nothing to back up (hence restore) as thin client does not hold any data (nor commit logs worth to backup / restore). However, one _can_ backup an empty table. It is just meaningless to do that. Having said that, Esop should not be affected when a backup is taken or restore is done. When backup is executed in a cluster-wide setup, via Icarus, this use-case seems to be covered just fine. (not tested, just followed the code). Icarus construct a topology of nodes to send all individual backup requests to and this topology is based on the nodes which are part of the ring so nodes which are not part of the ring (thin clients) should be already excluded from Icarus interaction.
+
+==== Everywhere strategy plugin
+
+This does not work with thin clients. The keyspace creation will succeed as well
+as table creation but any insert will fail as it will say it does not have enough replicas available. If we have a three-nodes cluster and one of them is a thin client, EverywhereStragety assumes that RF should be 3 but placing a replica on thin client will fail because it is not part of the ring.
+
+On the other hand, I think this is possible to fix, we would have to patch this plugin in such a way that the implementation of EverywhereStragy would have to check if the endpoint is a member of the ring. I verified it works https://github.com/instaclustr/cassandra-everywhere-strategy/pull/13[with this patch]
+
+==== Cassandra LDAP plugin
+
+It is questionable if this works. Since thin client is not a part of the ring, `system_auth` keyspace is completely empty. There are SSTables only in `system.sstable_activity`, `system.compaction_history`, `system.local`, `system.peers`, `system_schema` keyspace, no SSTables in `system_auth`. The way it works is that any authentication attempt is reading data from nodes in the ring. I am not completely sure if LDAP plugin is not reading the very local node and it would be a problem if there are no data on thin client without reaching to other nodes.
+
+==== Cassandra Kerberos plugin
+
+Potentially same problem as for LDAP.
+
+==== Minotaur
+
+Looking at the code of Minotaur, thin clients should be excluded from the repair / ring description. Should be fine. However, repair with Minotaur would have to be run from Instaclustr's internal perspective because if we expose only one contact point to a cluster behind PrivateLink, a respective user does not have any chance to talk to other node but the thin one and Minotaur would fail in that case.
+
+==== SSTable tools
+
+Not applicable.
+
+==== Lucene index plugin
+
+Not tested yet. A lot could go wrong. I am not sure how compatible this plugin is when a node is not part of the ring.
+
+==== Debezium connector
+
+Since thin client does not put any user data into a commitlog, there will be never any data generated / sent to Kafka from that particular node on cdc enabled tables.
+
+Other library we have are not affected or they are not applicable to this case.
