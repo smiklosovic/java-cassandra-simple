@@ -85,21 +85,7 @@ it will _always_ go to thin client first which then re-routes this to the right 
 Hence there will be always at least one hop by definition because we have a thin client in the way and from there
 it does not matter.
 
-=== Commit logs and memtables
-
-Thin client does not store any data hence it does not put any user data into commit logs either. One can skip everyhing commitlog-related when it comes to node configuration.
-
-Thin client also completely bypasses memtables.
-
-=== Caches
-
-I do not think this is applicable either on the thin client because it does not hold any data, by definition, so having a row cache, for example, does not make a lot of sense.
-
-I empirically verified that row cache settings in cassandra.yaml for a thin client are basically no-op. When I inserted data into a table, and I selected that row on some key, thin client did not cache anything but normal client did (looking into JMX row cache metrics).
-
-This effectively means that one can completely ignore row and key cache settings for thin client as it is not applicable.
-
-=== Creation of keyspaces / tables.
+=== Bug: creation of keyspaces / tables.
 
 When it comes to data which are held by a thin client when a keyspace or table is created, it just creates empty directory structute with keyspace / table name. It is basically a skeleton directory structure without any data (SSTables). In other words, data as such are not there, but the directory structure is. It looks like a proper table just with no data in it.
 
@@ -126,6 +112,38 @@ The fix would consist of us checking in Cassandra code whether there is enough s
 
 Other solution would consist of https://issues.apache.org/jira/browse/CASSANDRA-17500[Cassandra guardrail] but this will
 be available from Cassandra 4.2.
+
+
+=== Bug: if there are multiple coordinators, when one of them fails, Java driver will not automatically switch to the other one
+
+This is a serious issue. I created a ticket https://datastax-oss.atlassian.net/browse/JAVA-3032[here]. I think
+the reason this is happening is that when driver is about to connect to a cluster, it will try to connect to the
+first contact point among the list of the contact points in the configuration. When that happens, the driver will
+try to determine the topology of the cluster by looking into the peers table. However, peers table for a coordinator node
+does not contain other coordinator nodes. It contains only data nodes. That is the only way how to talk to them. But it
+does not contain any other coordinator node. Since we are white-listing nodes to connect to, it will never connect to
+data nodes. Hence, the obvious outcome is that it will not fall back to anything.
+
+=== Bug: disablement of native protocol breaks its enablement
+
+If you execute `nodetool disablebinary`, the coordinator node will stop to accept connections on CQL. The problem
+is that this is not possible to enable back. Doing `nodetool enablebinary` will fail. I discovered this bug just
+by accident. I created https://issues.apache.org/jira/browse/CASSANDRA-17752[this issue]. I have an idea how to fix it,
+I have not done any progress in that matter yet.
+
+=== Commit logs and memtables
+
+Thin client does not store any data hence it does not put any user data into commit logs either. One can skip everyhing commitlog-related when it comes to node configuration.
+
+Thin client also completely bypasses memtables.
+
+=== Caches
+
+I do not think this is applicable either on the thin client because it does not hold any data, by definition, so having a row cache, for example, does not make a lot of sense.
+
+I empirically verified that row cache settings in cassandra.yaml for a thin client are basically no-op. When I inserted data into a table, and I selected that row on some key, thin client did not cache anything but normal client did (looking into JMX row cache metrics).
+
+This effectively means that one can completely ignore row and key cache settings for thin client as it is not applicable.
 
 === Do nodes do what they are supposed to do?
 
